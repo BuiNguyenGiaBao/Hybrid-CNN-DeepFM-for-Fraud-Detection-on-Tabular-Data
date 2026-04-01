@@ -6,7 +6,7 @@
 
 ## Abstract
 
-Fraud detection on large-scale tabular data is challenging because of extreme class imbalance, high dimensionality, and complex feature interactions. This project proposes a **Hybrid CNN–DeepFM architecture** for fraud detection on the **IEEE-CIS Fraud Detection Dataset**. The model combines CNN-based representation learning, attention pooling, low-rank bilinear interaction modeling, and DeepFM-based higher-order feature learning.  
+Fraud detection on large-scale tabular data is challenging because of extreme class imbalance, high dimensionality, and complex feature interactions. This project proposes a **Hybrid CNN–DeepFM architecture** for fraud detection on the **IEEE-CIS Fraud Detection Dataset**. The model combines CNN-based representation learning, attention pooling, low-rank bilinear interaction modeling, and DeepFM-based higher-order feature learning.
 
 To improve minority-class detection, the training pipeline is further enhanced with **Focal Loss**, **Weighted Random Sampling**, and **validation-based threshold tuning**. Experimental results show that the optimized pipeline substantially improves fraud recall while maintaining strong discriminative ability in terms of ROC-AUC.
 
@@ -73,7 +73,7 @@ The preprocessing pipeline includes:
 
 ## 4. Model Architecture
 
-## 4.1 CNN-Based Feature Extractor
+### 4.1 CNN-Based Feature Extractor
 
 The first stage transforms tabular features into dense latent representations through:
 
@@ -85,15 +85,11 @@ The first stage transforms tabular features into dense latent representations th
 
 This stage allows the model to learn structured latent patterns from raw tabular inputs.
 
----
-
-## 4.2 Low-Rank Bilinear Interaction Modeling
+### 4.2 Low-Rank Bilinear Interaction Modeling
 
 After attention pooling, the model applies **low-rank bilinear pooling** to capture pairwise interactions among latent features. This helps represent second-order dependencies efficiently without a full bilinear parameter explosion.
 
----
-
-## 4.3 DeepFM for Relationship Learning
+### 4.3 DeepFM for Relationship Learning
 
 The learned CNN embeddings are passed into a **DeepFM** module, which includes:
 
@@ -232,14 +228,85 @@ project/
 │
 ├── best_fraud_model.pth
 └── README.md
-
+```
 
 ---
 
+## How to Run
 
+### 1. Prepare the environment
 
-```markdown
+Install the required Python packages before running the project:
 
+```bash
+pip install torch torchvision torchaudio
+pip install pandas numpy scikit-learn matplotlib seaborn tqdm
+```
+
+### 2. Prepare the data
+
+Make sure the processed dataset files are stored in the following location:
+
+```bash
+data/merge/train_processed.csv
+data/merge/test_processed.csv
+```
+
+If you also have a validation file, it can be stored as:
+
+```bash
+data/merge/val_processed.csv
+```
+
+### 3. Train the model
+
+Run the training pipeline with focal loss and fraud-oriented threshold tuning:
+
+```bash
+python modules/training.py --mode train --use_focal_loss
+```
+
+You may also explicitly set the main hyperparameters:
+
+```bash
+python modules/training.py --mode train --use_focal_loss --focal_alpha 0.90 --focal_gamma 3.0 --threshold_metric recall
+```
+
+### 4. Train and generate predictions
+
+To train the model and then generate predictions on the processed test set:
+
+```bash
+python modules/training.py --mode train_and_predict --use_focal_loss
+```
+
+### 5. Predict using a saved checkpoint
+
+To load a trained model checkpoint and run prediction only:
+
+```bash
+python modules/training.py --mode predict --checkpoint best_fraud_model.pth
+```
+
+### 6. Output files
+
+After training, the following outputs will typically be generated:
+
+- `best_fraud_model.pth` – saved model checkpoint
+- `results/classification_report.txt` – classification report
+- `results/evaluation_metrics.png` – confusion matrix and ROC curve
+- `results/training_history.png` – training and validation curves
+- `submission.csv` – fraud probability predictions for the test set
+
+### 7. Notes
+
+- The optimized pipeline uses **Focal Loss**, **WeightedRandomSampler**, and **threshold tuning** to improve fraud recall.
+- The default processed file paths are resolved automatically from the project structure.
+- GPU is used automatically if CUDA is available; otherwise, the code runs on CPU.
+
+---
+
+## References
 
 1. Guo, H., Tang, R., Ye, Y., Li, Z., & He, X. (2017). **DeepFM: A Factorization-Machine Based Neural Network for CTR Prediction.** *Proceedings of the Twenty-Sixth International Joint Conference on Artificial Intelligence (IJCAI 2017)*, 1725–1731.
 
