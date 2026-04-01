@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import numpy as np
 from typing import Optional, Dict, Tuple
 from tqdm import tqdm
@@ -12,11 +12,70 @@ import pandas as pd
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score, 
     recall_score, f1_score, confusion_matrix, 
-    classification_report, roc_curve, auc
-)
+    classification_report, roc_curve, auc, precision_recall_curve)
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+
+
+def resolve_csv_path(csv_path: str) -> str:
+    """Resolve CSV path robustly for project layouts like data/merge/*.csv."""
+    candidate = Path(csv_path)
+    if candidate.exists():
+        return str(candidate)
+
+    script_dir = Path(__file__).resolve().parent
+    search_roots = [Path.cwd(), script_dir, script_dir.parent]
+    candidate_names = [candidate.name]
+
+    for root in search_roots:
+        for rel in [candidate, Path('data/merge') / candidate.name, Path('merge') / candidate.name, Path('data') / candidate.name]:
+            full = (root / rel).resolve()
+            if full.exists():
+                return str(full)
+
+    raise FileNotFoundError(
+        f"Could not find CSV file: {csv_path}. "
+        f"Try --train_csv data/merge/{candidate.name} or place the file in the project root."
+    )
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for imbalanced binary classification."""
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        alpha_t = torch.where(targets == 1, torch.full_like(targets, self.alpha), torch.full_like(targets, 1 - self.alpha))
+        loss = alpha_t * (1 - pt).pow(self.gamma) * bce
+        return loss.mean()
+
+
+def find_best_threshold(y_true: np.ndarray, y_probs: np.ndarray, metric: str = "f1") -> float:
+    """Find best probability threshold on validation set."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_probs)
+    if len(thresholds) == 0:
+        return 0.5
+
+    precision = precision[:-1]
+    recall = recall[:-1]
+
+    if metric == "recall":
+        valid = precision >= 0.5
+        if valid.any():
+            candidate_thresholds = thresholds[valid]
+            candidate_recalls = recall[valid]
+            return float(candidate_thresholds[np.argmax(candidate_recalls)])
+        return float(thresholds[np.argmax(recall)])
+
+    f1_scores = 2 * precision * recall / (precision + recall + 1e-8)
+    return float(thresholds[np.argmax(f1_scores)])
 
 
 class HybridCNNDeepFM(nn.Module):
@@ -146,16 +205,22 @@ class FraudDetectionTrainer:
         learning_rate: float=1e-3,
         weight_decay: float=1e-5,
         pos_weight: Optional[float]=None,
+        use_focal_loss: bool=True,
+        focal_alpha: float=0.75,
+        focal_gamma: float=2.0,
+        threshold_metric: str='f1',
     ):
         self.model = model.to(device)
         self.device = device
-        
+        self.best_threshold = 0.5
+        self.threshold_metric = threshold_metric
+
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
-        
+
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='min',
@@ -163,9 +228,11 @@ class FraudDetectionTrainer:
             patience=5,
             verbose=True
         )
-        
-        # Loss function with pos_weight for imbalanced data
-        if pos_weight is not None:
+
+        if use_focal_loss:
+            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+            print(f"✓ Using FocalLoss(alpha={focal_alpha:.2f}, gamma={focal_gamma:.2f})")
+        elif pos_weight is not None:
             pos_weight_tensor = torch.tensor([pos_weight]).to(device)
             self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
             print(f"✓ Using BCEWithLogitsLoss with pos_weight={pos_weight:.2f}")
@@ -201,7 +268,7 @@ class FraudDetectionTrainer:
             self.optimizer.step()
 
             # Store predictions
-            preds = (probs > 0.5).long()
+            preds = (probs > self.best_threshold).long()
             all_preds.extend(preds.cpu().detach().numpy())
             all_probs.extend(probs.cpu().detach().numpy())
             all_labels.extend(batch_y.cpu().detach().numpy())
@@ -232,12 +299,11 @@ class FraudDetectionTrainer:
         return metrics
 
     @torch.no_grad()
-    def evaluate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Evaluate on validation set"""
+    def evaluate(self, val_loader: DataLoader, tune_threshold: bool=False) -> Dict[str, float]:
+        """Evaluate on validation set, optionally tuning threshold from validation probabilities."""
         self.model.eval()
 
         total_loss = 0.0
-        all_preds = []
         all_probs = []
         all_labels = []
 
@@ -250,31 +316,33 @@ class FraudDetectionTrainer:
             loss = self.criterion(logits, batch_y)
 
             total_loss += loss.item()
-            
-            # Store predictions
-            preds = (probs > 0.5).long()
-            all_preds.extend(preds.cpu().detach().numpy())
             all_probs.extend(probs.cpu().detach().numpy())
             all_labels.extend(batch_y.cpu().detach().numpy())
 
-        all_preds = np.array(all_preds)
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
-        
+
+        threshold = self.best_threshold
+        if tune_threshold:
+            threshold = find_best_threshold(all_labels, all_probs, metric=self.threshold_metric)
+            self.best_threshold = threshold
+
+        all_preds = (all_probs > threshold).astype(int)
+
         metrics = {
             'loss': total_loss / len(val_loader),
             'accuracy': accuracy_score(all_labels, all_preds),
             'precision': precision_score(all_labels, all_preds, zero_division=0),
             'recall': recall_score(all_labels, all_preds, zero_division=0),
             'f1': f1_score(all_labels, all_preds, zero_division=0),
+            'threshold': float(threshold),
         }
-        
-        # Calculate AUC
+
         try:
             metrics['auc'] = roc_auc_score(all_labels, all_probs)
-        except:
+        except Exception:
             metrics['auc'] = 0.0
-        
+
         return metrics
 
     def fit(
@@ -287,7 +355,8 @@ class FraudDetectionTrainer:
     ):
         """Full training loop with early stopping"""
 
-        best_val_auc = 0.0
+        monitor_metric = 'recall' if self.threshold_metric == 'recall' else 'f1'
+        best_monitor_score = -float('inf')
         patience_counter = 0
 
         history = {
@@ -304,7 +373,7 @@ class FraudDetectionTrainer:
 
             # Train and validate
             train_metrics = self.train_epoch(train_loader)
-            val_metrics = self.evaluate(val_loader)
+            val_metrics = self.evaluate(val_loader, tune_threshold=True)
 
             # Learning rate scheduling
             self.scheduler.step(val_metrics['loss'])
@@ -323,11 +392,13 @@ class FraudDetectionTrainer:
             print(f"\nValidation Metrics:")
             print(f"  Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']:.4f} | "
                   f"Prec: {val_metrics['precision']:.4f} | Rec: {val_metrics['recall']:.4f}")
-            print(f"  F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f}")
+            print(f"  F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f} | Thr: {val_metrics['threshold']:.4f}")
 
-            # Early stopping based on AUC
-            if val_metrics['auc'] > best_val_auc:
-                best_val_auc = val_metrics['auc']
+            current_score = val_metrics[monitor_metric]
+
+            # Early stopping based on fraud-oriented metric
+            if current_score > best_monitor_score:
+                best_monitor_score = current_score
                 patience_counter = 0
 
                 if save_path:
@@ -342,10 +413,13 @@ class FraudDetectionTrainer:
                             'val_recall': val_metrics['recall'],
                             'val_f1': val_metrics['f1'],
                             'val_auc': val_metrics['auc'],
+                            'best_threshold': val_metrics['threshold'],
+                            'monitor_metric': monitor_metric,
+                            'best_monitor_score': current_score,
                         },
                         save_path
                     )
-                    print(f"\n✓ Best model saved! (AUC: {best_val_auc:.4f})")
+                    print(f"\n✓ Best model saved! ({monitor_metric.upper()}: {best_monitor_score:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= early_stopping_patience:
@@ -373,7 +447,7 @@ class FraudDetectionTrainer:
             # Forward pass
             logits = self.model(batch_x).view(-1)
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
+            preds = (probs > self.best_threshold).long()
             
             all_preds.append(preds.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
@@ -393,6 +467,10 @@ class FraudDetectionTrainer:
         print(f"  Val Loss: {checkpoint['val_loss']:.4f}")
         print(f"  Val AUC: {checkpoint['val_auc']:.4f}")
         print(f"  Val F1: {checkpoint['val_f1']:.4f}")
+        self.best_threshold = checkpoint.get('best_threshold', 0.5)
+        print(f"  Best Threshold: {self.best_threshold:.4f}")
+        if 'monitor_metric' in checkpoint:
+            print(f"  Monitor Metric: {checkpoint['monitor_metric']} = {checkpoint.get('best_monitor_score', float('nan')):.4f}")
 
     def save_best_metrics(self, val_loader: DataLoader, save_dir: str='./results'):
         """Save detailed evaluation metrics and plots"""
@@ -408,7 +486,7 @@ class FraudDetectionTrainer:
                 batch_x = batch_x.to(self.device)
                 logits = self.model(batch_x).view(-1)
                 probs = torch.sigmoid(logits)
-                preds = (probs > 0.5).long()
+                preds = (probs > self.best_threshold).long()
                 
                 all_preds.extend(preds.cpu().numpy())
                 all_probs.extend(probs.cpu().numpy())
@@ -428,6 +506,7 @@ class FraudDetectionTrainer:
 
         # Save report
         with open(f'{save_dir}/classification_report.txt', 'w') as f:
+            f.write(f'Best threshold: {self.best_threshold:.6f}\n\n')
             f.write(report)
 
         # Confusion matrix
@@ -498,9 +577,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Fraud Detection with Hybrid CNN-DeepFM'
     )
-    parser.add_argument('--train_csv', type=str, default='train_processed.csv',
+    parser.add_argument('--train_csv', type=str, default='data/merge/train_processed.csv',
                        help='Path to training CSV')
-    parser.add_argument('--test_csv', type=str, default='test_processed.csv',
+    parser.add_argument('--test_csv', type=str, default='data/merge/test_processed.csv',
                        help='Path to test CSV')
     parser.add_argument('--output', type=str, default='submission.csv',
                        help='Output submission file')
@@ -523,11 +602,22 @@ if __name__ == "__main__":
                        help='Path to save best model')
     parser.add_argument('--results_dir', type=str, default='./results',
                        help='Directory to save results')
+    parser.add_argument('--use_focal_loss', action='store_true', default=True,
+                       help='Use Focal Loss for imbalanced fraud detection')
+    parser.add_argument('--focal_alpha', type=float, default=0.90,
+                       help='Alpha parameter for Focal Loss')
+    parser.add_argument('--focal_gamma', type=float, default=3.0,
+                       help='Gamma parameter for Focal Loss')
+    parser.add_argument('--threshold_metric', type=str, default='recall', choices=['f1', 'recall'],
+                       help='Metric used to tune classification threshold on validation set')
     
     args = parser.parse_args()
     
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
+    args.train_csv = resolve_csv_path(args.train_csv)
+    args.test_csv = resolve_csv_path(args.test_csv)
+
     print("\n" + "="*70)
     print("🔍 IEEE-CIS FRAUD DETECTION: Hybrid CNN-DeepFM")
     print("="*70)
@@ -556,11 +646,24 @@ if __name__ == "__main__":
         print(f"📈 Train samples: {len(train_dataset)}")
         print(f"📉 Val samples: {len(val_dataset)}\n")
         
+        # Create fraud-aware train sampler
+        train_indices = train_dataset.indices
+        train_labels = full_dataset.y[train_indices].numpy().astype(int)
+        class_counts = np.bincount(train_labels, minlength=2).astype(np.float64)
+        class_counts[class_counts == 0] = 1.0
+        class_weights = 1.0 / class_counts
+        sample_weights = class_weights[train_labels]
+        train_sampler = WeightedRandomSampler(
+            weights=torch.DoubleTensor(sample_weights),
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            sampler=train_sampler,
             num_workers=4,
             pin_memory=True if DEVICE == 'cuda' else False
         )
@@ -608,7 +711,11 @@ if __name__ == "__main__":
             device=DEVICE,
             learning_rate=args.lr,
             weight_decay=1e-5,
-            pos_weight=pos_weight
+            pos_weight=pos_weight,
+            use_focal_loss=args.use_focal_loss,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
+            threshold_metric=args.threshold_metric,
         )
         
         history = trainer.fit(
