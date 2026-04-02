@@ -46,7 +46,7 @@ Additionally, imbalance handling techniques are applied:
 - F1-score: ~0.19
 - ROC-AUC: ~0.80
 - PR-AUC: ~0.30
-=======
+
 ### 4.1 CNN-Based Feature Extractor
 
 
@@ -75,7 +75,7 @@ The Hybrid CNN–DeepFM model effectively captures feature interactions in tabul
 - Incorporate temporal transaction patterns
 - Ensemble with boosting-based models (e.g., LightGBM, XGBoost)
 - Dynamic threshold optimization
-=======
+
 ### 4.2 Low-Rank Bilinear Interaction Modeling
 
 After attention pooling, the model applies **low-rank bilinear pooling** to capture pairwise interactions among latent features. This helps represent second-order dependencies efficiently without a full bilinear parameter explosion.
