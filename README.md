@@ -1,10 +1,8 @@
 # Hybrid CNN–DeepFM for Fraud Detection on Tabular Data
 
-### An Empirical Study on the IEEE-CIS Fraud Detection Dataset
-
----
-
 ## Abstract
+This project proposes a Hybrid CNN–DeepFM architecture for fraud detection using the IEEE-CIS dataset. The model integrates convolutional feature extraction, attention mechanisms, and feature interaction learning to handle high-dimensional tabular data. The final model achieves high precision (~0.74) with moderate discriminative performance (ROC-AUC ~0.80), though recall remains limited (~0.11) due to conservative decision behavior.
+=======
 
 Fraud detection on large-scale tabular data is challenging because of extreme class imbalance, high dimensionality, and complex feature interactions. This project proposes a **Hybrid CNN–DeepFM architecture** for fraud detection on the **IEEE-CIS Fraud Detection Dataset**. The model combines CNN-based representation learning, attention pooling, low-rank bilinear interaction modeling, and DeepFM-based higher-order feature learning.
 
@@ -13,78 +11,71 @@ To improve minority-class detection, the training pipeline is further enhanced w
 ---
 
 ## 1. Introduction
-
-Fraud detection in tabular transaction data is a highly imbalanced binary classification problem. Traditional machine learning models such as gradient boosting are strong baselines, but they often depend heavily on manual feature engineering. Deep learning methods, in contrast, can automatically learn latent feature representations and nonlinear interactions.
-
-This project investigates a hybrid architecture designed to model complex relationships within tabular records:
-
-1. **CNN-based feature extraction** for representation learning on tabular inputs.
-2. **Attention pooling** to focus on informative latent patterns.
-3. **Low-rank bilinear pooling** to capture feature interactions.
-4. **DeepFM** to jointly learn first-order, second-order, and higher-order relationships.
-
-The optimized version of the pipeline also incorporates imbalance-aware training strategies to improve fraud detection recall.
+Fraud detection is a challenging task due to extreme class imbalance and complex feature interactions. Traditional machine learning models often struggle to capture nonlinear dependencies in tabular data. This project explores a deep learning approach combining CNN and DeepFM to improve representation learning and predictive performance.
 
 ---
 
 ## 2. Dataset
-
-### IEEE-CIS Fraud Detection Dataset
-
-The IEEE-CIS Fraud Detection dataset contains transaction and identity information from real-world e-commerce activity. It includes:
-
-- **Transaction features**: transaction amount, product code, temporal variables, and anonymized transaction attributes.
-- **Identity features**: device, browser, and other anonymized identity-related variables.
-- **Target label**: `isFraud` (binary classification).
-
-### Key characteristics
-
-- Severe class imbalance (fraud is a small minority class)
-- Large number of missing values
-- High-dimensional heterogeneous features
-- Mixture of transaction-level and identity-level information
+The IEEE-CIS Fraud Detection dataset contains transaction and identity features derived from real-world e-commerce data. Key characteristics include:
+- Severe class imbalance
+- High dimensionality
+- Mixed feature types (categorical and numerical)
 
 ---
 
-## 3. Data Preprocessing
+## 3. Methodology
+The proposed model consists of:
+- CNN-based feature extractor for local pattern learning
+- Attention pooling for feature importance weighting
+- Bilinear interaction module for feature crossing
+- DeepFM component for implicit and explicit interactions
 
-The preprocessing pipeline includes:
-
-1. **Table merging**
-   - `train_transaction` merged with `train_identity`
-   - `test_transaction` merged with `test_identity`
-   - joined using `TransactionID`
-
-2. **Missing value handling**
-   - Infinite values replaced with `NaN`
-   - Missing values filled during preprocessing
-
-3. **Categorical encoding**
-   - Categorical variables encoded into numeric form for model input
-
-4. **Feature alignment**
-   - Train and test sets aligned to ensure the same feature space
-
-5. **Output files**
-   - `train_processed.csv`
-   - `test_processed.csv`
+Additionally, imbalance handling techniques are applied:
+- Focal Loss
+- Weighted Random Sampling
+- Threshold tuning
 
 ---
 
-## 4. Model Architecture
+## 4. Experimental Results
 
+
+### Final Performance:
+- Precision: ~0.74
+- Recall: ~0.11
+- F1-score: ~0.19
+- ROC-AUC: ~0.80
+- PR-AUC: ~0.30
+=======
 ### 4.1 CNN-Based Feature Extractor
 
-The first stage transforms tabular features into dense latent representations through:
 
-- Linear embedding of tabular inputs
-- Projection into a pseudo-sequence structure
-- 1D convolutional layers for local pattern extraction
-- Batch normalization and ReLU activation
-- Attention pooling for adaptive feature aggregation
+### Confusion Matrix Insight:
+- True Positives: 460
+- False Negatives: 3673
+- False Positives: 159
 
-This stage allows the model to learn structured latent patterns from raw tabular inputs.
+The model demonstrates high reliability in predicted fraud cases but misses a significant portion of actual fraud instances.
 
+
+---
+
+## 5. Discussion
+The model exhibits a high-precision, low-recall trade-off. This indicates a conservative prediction strategy, where fraud is only detected when the model is highly confident. While this reduces false positives, it leads to lower coverage of fraudulent transactions.
+
+---
+
+## 6. Conclusion
+The Hybrid CNN–DeepFM model effectively captures feature interactions in tabular fraud detection tasks. It is particularly suitable for high-precision scenarios, such as fraud verification systems. However, improvements are needed to increase recall for broader fraud coverage.
+
+---
+
+## 7. Future Work
+- Improve recall using graph-based models (GNN)
+- Incorporate temporal transaction patterns
+- Ensemble with boosting-based models (e.g., LightGBM, XGBoost)
+- Dynamic threshold optimization
+=======
 ### 4.2 Low-Rank Bilinear Interaction Modeling
 
 After attention pooling, the model applies **low-rank bilinear pooling** to capture pairwise interactions among latent features. This helps represent second-order dependencies efficiently without a full bilinear parameter explosion.
@@ -323,3 +314,4 @@ After training, the following outputs will typically be generated:
 7. Shwartz-Ziv, R., & Armon, A. (2022). **Tabular Data: Deep Learning is Not All You Need.** *Information Fusion*, 81, 84–90.
 
 8. IEEE Computational Intelligence Society. **IEEE-CIS Fraud Detection Dataset Documentation.**
+
