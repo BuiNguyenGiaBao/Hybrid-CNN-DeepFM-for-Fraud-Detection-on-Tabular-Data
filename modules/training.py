@@ -1,47 +1,63 @@
+import argparse
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-import numpy as np
-from typing import Optional, Dict, Tuple
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
+
 from cnn_for_extract_feature import TabularCNNNetwork
 from deepfm_for_relationship import DeepFM
-import argparse
-import pandas as pd
-from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, 
-    recall_score, f1_score, confusion_matrix, 
-    classification_report, roc_curve, auc, precision_recall_curve)
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
 
 
 def resolve_csv_path(csv_path: str) -> str:
-    """Resolve CSV path robustly for project layouts like data/merge/*.csv."""
     candidate = Path(csv_path)
     if candidate.exists():
         return str(candidate)
 
     script_dir = Path(__file__).resolve().parent
     search_roots = [Path.cwd(), script_dir, script_dir.parent]
-    candidate_names = [candidate.name]
-
     for root in search_roots:
-        for rel in [candidate, Path('data/merge') / candidate.name, Path('merge') / candidate.name, Path('data') / candidate.name]:
+        for rel in [
+            candidate,
+            Path("data/merge") / candidate.name,
+            Path("merge") / candidate.name,
+            Path("data") / candidate.name,
+        ]:
             full = (root / rel).resolve()
             if full.exists():
                 return str(full)
 
-    raise FileNotFoundError(
-        f"Could not find CSV file: {csv_path}. "
-        f"Try --train_csv data/merge/{candidate.name} or place the file in the project root."
-    )
+    raise FileNotFoundError(f"Could not find CSV file: {csv_path}")
+
+
+def set_seed(seed: int = 42) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class FocalLoss(nn.Module):
-    """Focal Loss for imbalanced binary classification."""
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
@@ -52,55 +68,73 @@ class FocalLoss(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         probs = torch.sigmoid(logits)
         pt = torch.where(targets == 1, probs, 1 - probs)
-        alpha_t = torch.where(targets == 1, torch.full_like(targets, self.alpha), torch.full_like(targets, 1 - self.alpha))
-        loss = alpha_t * (1 - pt).pow(self.gamma) * bce
-        return loss.mean()
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(targets, self.alpha),
+            torch.full_like(targets, 1 - self.alpha),
+        )
+        return (alpha_t * (1 - pt).pow(self.gamma) * bce).mean()
 
 
-def find_best_threshold(y_true: np.ndarray, y_probs: np.ndarray, metric: str = "f1") -> float:
-    """Find best probability threshold on validation set."""
+def bounded_best_threshold(
+    y_true: np.ndarray,
+    y_probs: np.ndarray,
+    metric: str = "f1",
+    min_precision: float = 0.30,
+    min_threshold: float = 0.70,
+    max_threshold: float = 0.95,
+) -> float:
     precision, recall, thresholds = precision_recall_curve(y_true, y_probs)
     if len(thresholds) == 0:
         return 0.5
 
     precision = precision[:-1]
     recall = recall[:-1]
+    thresholds = thresholds.astype(float)
+
+    valid = (thresholds >= min_threshold) & (thresholds <= max_threshold)
+    if not valid.any():
+        valid = np.ones_like(thresholds, dtype=bool)
 
     if metric == "recall":
-        valid = precision >= 0.5
-        if valid.any():
-            candidate_thresholds = thresholds[valid]
-            candidate_recalls = recall[valid]
-            return float(candidate_thresholds[np.argmax(candidate_recalls)])
-        return float(thresholds[np.argmax(recall)])
+        mask = valid & (precision >= min_precision)
+        if mask.any():
+            return float(thresholds[mask][np.argmax(recall[mask])])
+        return float(thresholds[valid][np.argmax(recall[valid])])
 
-    f1_scores = 2 * precision * recall / (precision + recall + 1e-8)
-    return float(thresholds[np.argmax(f1_scores)])
+    if metric == "f1":
+        score = 2 * precision * recall / (precision + recall + 1e-8)
+    else:  # f2 default for fraud recall emphasis
+        beta2 = 4.0
+        score = (1 + beta2) * precision * recall / (beta2 * precision + recall + 1e-8)
+
+    mask = valid & (precision >= min_precision)
+    if mask.any():
+        return float(thresholds[mask][np.argmax(score[mask])])
+    return float(thresholds[valid][np.argmax(score[valid])])
 
 
 class HybridCNNDeepFM(nn.Module):
-    """Hybrid CNN-DeepFM model for fraud detection"""
-    def __init__(self, tabular_dim: int, 
-                # CNN        
-                embed_dim=64,
-                conv_channels=128,
-                kernel_size=3,
-                bilinear_rank=64,
-                bilinear_out_dim=256,
-                seq_length=10,
-                cnn_dropout=0.3,
-                # DeepFM params
-                num_classes: int=2,
-                deepfm_embed_dim: int=16,
-                deepfm_hidden=None,
-                deepfm_dropout: float=0.2,
-                # Training mode
-                freeze_cnn: bool=False):
+    def __init__(
+        self,
+        tabular_dim: int,
+        embed_dim: int = 40,
+        conv_channels: int = 56,
+        kernel_size: int = 3,
+        bilinear_rank: int = 24,
+        bilinear_out_dim: int = 96,
+        seq_length: int = 8,
+        cnn_dropout: float = 0.55,
+        num_classes: int = 2,
+        deepfm_embed_dim: int = 10,
+        deepfm_hidden=None,
+        deepfm_dropout: float = 0.45,
+        freeze_cnn: bool = False,
+    ):
         super().__init__()
-        self.num_classes = num_classes
         self.freeze_cnn = freeze_cnn
+        deepfm_hidden = deepfm_hidden or [96, 48]
 
-        # CNN Feature Extractor
         self.cnn = TabularCNNNetwork(
             tabular_dim=tabular_dim,
             embed_dim=embed_dim,
@@ -110,11 +144,9 @@ class HybridCNNDeepFM(nn.Module):
             bilinear_out_dim=bilinear_out_dim,
             num_classes=num_classes,
             seq_length=seq_length,
-            dropout=cnn_dropout
+            dropout=cnn_dropout,
         )
 
-        # DeepFM for relationship learning
-        deepfm_hidden = deepfm_hidden or [256, 128, 64]
         self.deepfm = DeepFM(
             num_classes=num_classes,
             categorical_cardinalities=None,
@@ -123,7 +155,7 @@ class HybridCNNDeepFM(nn.Module):
             deep_hidden=deepfm_hidden,
             dropout=deepfm_dropout,
             dense_in_dim=bilinear_out_dim,
-            use_bias=True
+            use_bias=True,
         )
 
         if freeze_cnn:
@@ -131,60 +163,40 @@ class HybridCNNDeepFM(nn.Module):
                 p.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: CNN Feature Extract -> DeepFM Classification"""
-        cnn_features = self.cnn.get_embedding(x, detach=self.freeze_cnn)
-        logits = self.deepfm(dense_x=cnn_features)
-        return logits
-
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract CNN features only"""
-        return self.cnn.get_embedding(x, detach=True)
-
-    def get_attention_weights(self, x: torch.Tensor) -> torch.Tensor:
-        """Get attention weights from CNN"""
-        return self.cnn.get_attention_weights(x)
+        features = self.cnn.get_embedding(x, detach=self.freeze_cnn)
+        return self.deepfm(dense_x=features)
 
 
 class IEEEFraudDataset(Dataset):
-    """Dataset for IEEE-CIS Fraud Detection"""
-    def __init__(self, csv_path: str, target_col: str='isFraud', normalize: bool=False):
+    def __init__(self, csv_path: str, target_col: str = "isFraud", drop_id_cols: bool = True):
         print(f"Loading data from {csv_path}...")
         df = pd.read_csv(csv_path)
-
-        # Handle infinite and missing values
         df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(0.0)
-        
-        # Load features and target
-        if target_col in df.columns:
+
+        if drop_id_cols:
+            drop_cols = [c for c in ["TransactionID"] if c in df.columns]
+            if drop_cols:
+                df = df.drop(columns=drop_cols)
+
+        self.has_target = target_col in df.columns
+        if self.has_target:
             self.y = torch.FloatTensor(df[target_col].values)
-            self.X = torch.FloatTensor(df.drop(columns=[target_col]).values)
-            self.has_target = True
+            X_df = df.drop(columns=[target_col])
         else:
-            self.X = torch.FloatTensor(df.values)
             self.y = None
-            self.has_target = False
+            X_df = df
 
-        # Store feature names
-        self.feature_names = (
-            df.drop(columns=[target_col]).columns.tolist()
-            if self.has_target else df.columns.tolist()
-        )
-
-        # Normalize features if requested
-        if normalize and self.X.shape[0] > 0:
-            mean = self.X.mean(dim=0)
-            std = self.X.std(dim=0)
-            std[std == 0] = 1.0  # Avoid division by zero
-            self.X = (self.X - mean) / std
+        X_df = X_df.fillna(0.0)
+        self.feature_names = X_df.columns.tolist()
+        self.X = torch.FloatTensor(X_df.values)
 
         print(f"✓ Loaded {len(self.X)} samples with {self.X.shape[1]} features")
         if self.has_target:
-            fraud_ratio = self.y.mean().item()
+            fraud_ratio = float(self.y.mean().item())
             n_fraud = int(self.y.sum().item())
             n_normal = len(self.y) - n_fraud
             print(f"✓ Class distribution: Normal={n_normal}, Fraud={n_fraud}")
-            print(f"✓ Fraud ratio: {fraud_ratio*100:.2f}%")
+            print(f"✓ Fraud ratio: {fraud_ratio * 100:.4f}%")
 
     def __len__(self):
         return len(self.X)
@@ -192,671 +204,449 @@ class IEEEFraudDataset(Dataset):
     def __getitem__(self, idx):
         if self.has_target:
             return self.X[idx], self.y[idx]
-        else:
-            return self.X[idx]
+        return self.X[idx]
 
 
 class FraudDetectionTrainer:
-    """Trainer for Fraud Detection Classification"""
     def __init__(
         self,
-        model: HybridCNNDeepFM,
-        device: str='cuda' if torch.cuda.is_available() else 'cpu',
-        learning_rate: float=1e-3,
-        weight_decay: float=1e-5,
-        pos_weight: Optional[float]=None,
-        use_focal_loss: bool=True,
-        focal_alpha: float=0.75,
-        focal_gamma: float=2.0,
-        threshold_metric: str='f1',
+        model: nn.Module,
+        device: str,
+        learning_rate: float = 1.0e-3,
+        weight_decay: float = 5e-5,
+        pos_weight: Optional[float] = None,
+        use_focal_loss: bool = False,
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
+        threshold_metric: str = "f1",
+        threshold_min_precision: float = 0.20,
+        threshold_warmup_epochs: int = 6,
+        fixed_threshold: Optional[float] = None,
     ):
         self.model = model.to(device)
         self.device = device
-        self.best_threshold = 0.5
+        self.best_threshold = float(fixed_threshold) if fixed_threshold is not None else 0.5
+        self.fixed_threshold = fixed_threshold
         self.threshold_metric = threshold_metric
+        self.threshold_min_precision = threshold_min_precision
+        self.threshold_warmup_epochs = threshold_warmup_epochs
+        self.current_epoch = 0
 
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
-
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            verbose=True
+            self.optimizer, mode="max", factor=0.5, patience=2
         )
 
         if use_focal_loss:
             self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
             print(f"✓ Using FocalLoss(alpha={focal_alpha:.2f}, gamma={focal_gamma:.2f})")
-        elif pos_weight is not None:
-            pos_weight_tensor = torch.tensor([pos_weight]).to(device)
-            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-            print(f"✓ Using BCEWithLogitsLoss with pos_weight={pos_weight:.2f}")
         else:
-            self.criterion = nn.BCEWithLogitsLoss()
-            print(f"✓ Using BCEWithLogitsLoss (balanced)")
-    
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """Train one epoch"""
+            if pos_weight is not None:
+                self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+                print(f"✓ Using BCEWithLogitsLoss(pos_weight={pos_weight:.4f})")
+            else:
+                self.criterion = nn.BCEWithLogitsLoss()
+                print("✓ Using BCEWithLogitsLoss()")
+
+    def _compute_metrics(self, y_true: np.ndarray, y_probs: np.ndarray, threshold: float) -> Dict[str, float]:
+        y_pred = (y_probs >= threshold).astype(int)
+        metrics = {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "recall": recall_score(y_true, y_pred, zero_division=0),
+            "f1": f1_score(y_true, y_pred, zero_division=0),
+            "pr_auc": average_precision_score(y_true, y_probs),
+            "threshold": float(threshold),
+        }
+        beta2 = 4.0
+        metrics["f2"] = (1 + beta2) * metrics["precision"] * metrics["recall"] / (
+            beta2 * metrics["precision"] + metrics["recall"] + 1e-8
+        )
+        try:
+            metrics["auc"] = roc_auc_score(y_true, y_probs)
+        except Exception:
+            metrics["auc"] = 0.0
+        return metrics
+
+    def train_epoch(self, loader: DataLoader) -> Dict[str, float]:
         self.model.train()
-
         total_loss = 0.0
-        all_preds = []
-        all_probs = []
-        all_labels = []
+        all_probs, all_labels = [], []
 
-        pbar = tqdm(train_loader, desc='Training')
+        pbar = tqdm(loader, desc="Training")
         for batch_x, batch_y in pbar:
             batch_x = batch_x.to(self.device)
             batch_y = batch_y.to(self.device).float()
 
-            # Forward pass
             logits = self.model(batch_x).view(-1)
             probs = torch.sigmoid(logits)
-
-            # Compute loss
             loss = self.criterion(logits, batch_y)
 
-            # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            # Store predictions
-            preds = (probs > self.best_threshold).long()
-            all_preds.extend(preds.cpu().detach().numpy())
-            all_probs.extend(probs.cpu().detach().numpy())
-            all_labels.extend(batch_y.cpu().detach().numpy())
-            
             total_loss += loss.item()
+            all_probs.extend(probs.detach().cpu().numpy())
+            all_labels.extend(batch_y.detach().cpu().numpy())
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        # Calculate metrics
-        all_preds = np.array(all_preds)
-        all_probs = np.array(all_probs)
-        all_labels = np.array(all_labels)
-        
-        metrics = {
-            'loss': total_loss / len(train_loader),
-            'accuracy': accuracy_score(all_labels, all_preds),
-            'precision': precision_score(all_labels, all_preds, zero_division=0),
-            'recall': recall_score(all_labels, all_preds, zero_division=0),
-            'f1': f1_score(all_labels, all_preds, zero_division=0),
-        }
-        
-        # Calculate AUC
-        try:
-            metrics['auc'] = roc_auc_score(all_labels, all_probs)
-        except:
-            metrics['auc'] = 0.0
-                
+        all_probs = np.asarray(all_probs)
+        all_labels = np.asarray(all_labels)
+        metrics = self._compute_metrics(all_labels, all_probs, threshold=self.best_threshold)
+        metrics["loss"] = total_loss / max(len(loader), 1)
         return metrics
 
     @torch.no_grad()
-    def evaluate(self, val_loader: DataLoader, tune_threshold: bool=False) -> Dict[str, float]:
-        """Evaluate on validation set, optionally tuning threshold from validation probabilities."""
+    def evaluate(self, loader: DataLoader, tune_threshold: bool = False) -> Dict[str, float]:
         self.model.eval()
-
         total_loss = 0.0
-        all_probs = []
-        all_labels = []
+        all_probs, all_labels = [], []
 
-        for batch_x, batch_y in val_loader:
+        for batch_x, batch_y in loader:
             batch_x = batch_x.to(self.device)
             batch_y = batch_y.to(self.device).float()
-
             logits = self.model(batch_x).view(-1)
             probs = torch.sigmoid(logits)
             loss = self.criterion(logits, batch_y)
-
             total_loss += loss.item()
-            all_probs.extend(probs.cpu().detach().numpy())
-            all_labels.extend(batch_y.cpu().detach().numpy())
+            all_probs.extend(probs.detach().cpu().numpy())
+            all_labels.extend(batch_y.detach().cpu().numpy())
 
-        all_probs = np.array(all_probs)
-        all_labels = np.array(all_labels)
+        all_probs = np.asarray(all_probs)
+        all_labels = np.asarray(all_labels)
 
-        threshold = self.best_threshold
-        if tune_threshold:
-            threshold = find_best_threshold(all_labels, all_probs, metric=self.threshold_metric)
+        threshold = float(self.best_threshold)
+
+        # Warmup: avoid overly conservative thresholds in early epochs
+        if self.current_epoch <= 3:
+            threshold = 0.50
+            self.best_threshold = threshold
+        elif self.current_epoch <= self.threshold_warmup_epochs:
+            threshold = 0.60 if self.fixed_threshold is None else min(float(self.fixed_threshold), 0.60)
+            self.best_threshold = threshold
+        elif self.fixed_threshold is not None:
+            threshold = float(self.fixed_threshold)
+            self.best_threshold = threshold
+        elif tune_threshold:
+            threshold = bounded_best_threshold(
+                all_labels,
+                all_probs,
+                metric=self.threshold_metric,
+                min_precision=self.threshold_min_precision,
+                min_threshold=0.60,
+                max_threshold=0.85,
+            )
             self.best_threshold = threshold
 
-        all_preds = (all_probs > threshold).astype(int)
-
-        metrics = {
-            'loss': total_loss / len(val_loader),
-            'accuracy': accuracy_score(all_labels, all_preds),
-            'precision': precision_score(all_labels, all_preds, zero_division=0),
-            'recall': recall_score(all_labels, all_preds, zero_division=0),
-            'f1': f1_score(all_labels, all_preds, zero_division=0),
-            'threshold': float(threshold),
-        }
-
-        try:
-            metrics['auc'] = roc_auc_score(all_labels, all_probs)
-        except Exception:
-            metrics['auc'] = 0.0
-
+        metrics = self._compute_metrics(all_labels, all_probs, threshold=threshold)
+        metrics["loss"] = total_loss / max(len(loader), 1)
         return metrics
 
-    def fit(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        epochs: int=100,
-        early_stopping_patience: int=10,
-        save_path: Optional[str]=None,
-    ):
-        """Full training loop with early stopping"""
+    def fit(self, train_loader: DataLoader, val_loader: DataLoader, epochs: int, early_stopping_patience: int, save_path: str):
+        history = {k: [] for k in [
+            "train_loss", "train_accuracy", "train_precision", "train_recall", "train_f1", "train_f2", "train_auc", "train_pr_auc",
+            "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1", "val_f2", "val_auc", "val_pr_auc", "val_threshold",
+        ]}
 
-        monitor_metric = 'recall' if self.threshold_metric == 'recall' else 'f1'
-        best_monitor_score = -float('inf')
-        patience_counter = 0
-
-        history = {
-            'train_loss': [], 'train_accuracy': [], 'train_precision': [], 
-            'train_recall': [], 'train_f1': [], 'train_auc': [],
-            'val_loss': [], 'val_accuracy': [], 'val_precision': [], 
-            'val_recall': [], 'val_f1': [], 'val_auc': []
-        }
+        best_score = -1e9
+        patience = 0
 
         for epoch in range(epochs):
-            print(f'\n{"="*70}')
-            print(f'Epoch {epoch+1}/{epochs}')
-            print(f'{"="*70}')
+            self.current_epoch = epoch + 1
+            print("\n" + "=" * 70)
+            print(f"Epoch {epoch + 1}/{epochs}")
+            print("=" * 70)
 
-            # Train and validate
             train_metrics = self.train_epoch(train_loader)
             val_metrics = self.evaluate(val_loader, tune_threshold=True)
 
-            # Learning rate scheduling
-            self.scheduler.step(val_metrics['loss'])
+            precision_gate = 1.0 if val_metrics["precision"] >= self.threshold_min_precision else 0.0
+            recall_gate = 1.0 if val_metrics["recall"] >= 0.10 else 0.0
+            score = (
+                0.35 * val_metrics["precision"]
+                + 0.30 * val_metrics["f1"]
+                + 0.20 * val_metrics["pr_auc"]
+                + 0.10 * val_metrics["auc"]
+                + 0.05 * precision_gate
+            )
+            if recall_gate == 0.0:
+                score -= 0.25
+            self.scheduler.step(score)
 
-            # Save history
-            for metric in ['loss', 'accuracy', 'precision', 'recall', 'f1', 'auc']:
-                history[f'train_{metric}'].append(train_metrics.get(metric, 0.0))
-                history[f'val_{metric}'].append(val_metrics.get(metric, 0.0))
+            for prefix, metrics in [("train", train_metrics), ("val", val_metrics)]:
+                for m in ["loss", "accuracy", "precision", "recall", "f1", "f2", "auc", "pr_auc"]:
+                    history[f"{prefix}_{m}"].append(metrics[m])
+            history["val_threshold"].append(val_metrics["threshold"])
 
-            # Logging
-            print(f"\nTrain Metrics:")
-            print(f"  Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.4f} | "
-                  f"Prec: {train_metrics['precision']:.4f} | Rec: {train_metrics['recall']:.4f}")
-            print(f"  F1: {train_metrics['f1']:.4f} | AUC: {train_metrics['auc']:.4f}")
+            print("\nTrain Metrics:")
+            print(
+                f"  Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.4f} | "
+                f"Prec: {train_metrics['precision']:.4f} | Rec: {train_metrics['recall']:.4f}"
+            )
+            print(
+                f"  F1: {train_metrics['f1']:.4f} | F2: {train_metrics['f2']:.4f} | "
+                f"AUC: {train_metrics['auc']:.4f} | PR-AUC: {train_metrics['pr_auc']:.4f}"
+            )
 
-            print(f"\nValidation Metrics:")
-            print(f"  Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']:.4f} | "
-                  f"Prec: {val_metrics['precision']:.4f} | Rec: {val_metrics['recall']:.4f}")
-            print(f"  F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f} | Thr: {val_metrics['threshold']:.4f}")
+            print("\nValidation Metrics:")
+            print(
+                f"  Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']:.4f} | "
+                f"Prec: {val_metrics['precision']:.4f} | Rec: {val_metrics['recall']:.4f}"
+            )
+            print(
+                f"  F1: {val_metrics['f1']:.4f} | F2: {val_metrics['f2']:.4f} | "
+                f"AUC: {val_metrics['auc']:.4f} | PR-AUC: {val_metrics['pr_auc']:.4f} | Thr: {val_metrics['threshold']:.4f}"
+            )
+            print(f"  Composite score: {score:.4f}")
 
-            current_score = val_metrics[monitor_metric]
-
-            # Early stopping based on fraud-oriented metric
-            if current_score > best_monitor_score:
-                best_monitor_score = current_score
-                patience_counter = 0
-
-                if save_path:
-                    torch.save(
-                        {
-                            'epoch': epoch,
-                            'model_state_dict': self.model.state_dict(),
-                            'optimizer_state_dict': self.optimizer.state_dict(),
-                            'val_loss': val_metrics['loss'],
-                            'val_accuracy': val_metrics['accuracy'],
-                            'val_precision': val_metrics['precision'],
-                            'val_recall': val_metrics['recall'],
-                            'val_f1': val_metrics['f1'],
-                            'val_auc': val_metrics['auc'],
-                            'best_threshold': val_metrics['threshold'],
-                            'monitor_metric': monitor_metric,
-                            'best_monitor_score': current_score,
-                        },
-                        save_path
-                    )
-                    print(f"\n✓ Best model saved! ({monitor_metric.upper()}: {best_monitor_score:.4f})")
+            if score > best_score:
+                best_score = score
+                patience = 0
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": self.model.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "best_threshold": self.best_threshold,
+                        "best_score": best_score,
+                        "val_metrics": val_metrics,
+                    },
+                    save_path,
+                )
+                print(f"\n✓ Best model saved! (Composite: {best_score:.4f})")
             else:
-                patience_counter += 1
-                if patience_counter >= early_stopping_patience:
-                    print(f"\n⛔ Early stopping triggered after {epoch+1} epochs")
+                patience += 1
+                if patience >= early_stopping_patience:
+                    print(f"\n⛔ Early stopping triggered after {epoch + 1} epochs")
                     break
 
         return history
-    
-    @torch.no_grad()
-    def predict(self, test_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
-        """Make predictions on test set"""
-        self.model.eval()
-        
-        all_preds = []
-        all_probs = []
-        
-        for batch in tqdm(test_loader, desc='Predicting'):
-            if isinstance(batch, (list, tuple)):
-                batch_x = batch[0]
-            else:
-                batch_x = batch
 
+    @torch.no_grad()
+    def predict(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        self.model.eval()
+        all_preds, all_probs = [], []
+        for batch in tqdm(loader, desc="Predicting"):
+            batch_x = batch[0] if isinstance(batch, (list, tuple)) else batch
             batch_x = batch_x.to(self.device)
-            
-            # Forward pass
             logits = self.model(batch_x).view(-1)
             probs = torch.sigmoid(logits)
-            preds = (probs > self.best_threshold).long()
-            
+            preds = (probs >= self.best_threshold).long()
             all_preds.append(preds.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
-        
-        predictions = np.concatenate(all_preds)
-        probabilities = np.concatenate(all_probs)
-        
-        return predictions, probabilities
-    
+        return np.concatenate(all_preds), np.concatenate(all_probs)
+
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model from checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        print(f"\n✓ Checkpoint loaded from epoch {checkpoint['epoch']}")
-        print(f"  Val Loss: {checkpoint['val_loss']:.4f}")
-        print(f"  Val AUC: {checkpoint['val_auc']:.4f}")
-        print(f"  Val F1: {checkpoint['val_f1']:.4f}")
-        self.best_threshold = checkpoint.get('best_threshold', 0.5)
-        print(f"  Best Threshold: {self.best_threshold:.4f}")
-        if 'monitor_metric' in checkpoint:
-            print(f"  Monitor Metric: {checkpoint['monitor_metric']} = {checkpoint.get('best_monitor_score', float('nan')):.4f}")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.best_threshold = float(ckpt.get("best_threshold", 0.5))
+        print(f"✓ Loaded checkpoint from epoch {ckpt['epoch'] + 1}")
+        print(f"✓ Best threshold: {self.best_threshold:.4f}")
+        if "best_score" in ckpt:
+            print(f"✓ Best composite score: {ckpt['best_score']:.4f}")
 
-    def save_best_metrics(self, val_loader: DataLoader, save_dir: str='./results'):
-        """Save detailed evaluation metrics and plots"""
+    @torch.no_grad()
+    def save_best_metrics(self, val_loader: DataLoader, save_dir: str = "./results"):
         Path(save_dir).mkdir(parents=True, exist_ok=True)
-        
         self.model.eval()
-        all_preds = []
-        all_probs = []
-        all_labels = []
+        all_probs, all_labels = [], []
 
-        with torch.no_grad():
-            for batch_x, batch_y in val_loader:
-                batch_x = batch_x.to(self.device)
-                logits = self.model(batch_x).view(-1)
-                probs = torch.sigmoid(logits)
-                preds = (probs > self.best_threshold).long()
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-                all_labels.extend(batch_y.cpu().numpy())
+        for batch_x, batch_y in val_loader:
+            batch_x = batch_x.to(self.device)
+            logits = self.model(batch_x).view(-1)
+            probs = torch.sigmoid(logits)
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(batch_y.numpy())
 
-        all_preds = np.array(all_preds)
-        all_probs = np.array(all_probs)
-        all_labels = np.array(all_labels)
+        all_probs = np.asarray(all_probs)
+        all_labels = np.asarray(all_labels)
+        all_preds = (all_probs >= self.best_threshold).astype(int)
 
-        # Generate classification report
-        report = classification_report(all_labels, all_preds, 
-                                      target_names=['Normal', 'Fraud'])
-        print("\n" + "="*60)
-        print("CLASSIFICATION REPORT")
-        print("="*60)
+        report = classification_report(all_labels, all_preds, target_names=["Normal", "Fraud"])
+        print("\nCLASSIFICATION REPORT")
         print(report)
-
-        # Save report
-        with open(f'{save_dir}/classification_report.txt', 'w') as f:
-            f.write(f'Best threshold: {self.best_threshold:.6f}\n\n')
+        with open(Path(save_dir) / "classification_report.txt", "w", encoding="utf-8") as f:
+            f.write(f"Best threshold: {self.best_threshold:.6f}\n\n")
             f.write(report)
 
-        # Confusion matrix
         cm = confusion_matrix(all_labels, all_preds)
-        
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Plot 1: Confusion Matrix
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
-                   xticklabels=['Normal', 'Fraud'],
-                   yticklabels=['Normal', 'Fraud'])
-        axes[0].set_title('Confusion Matrix')
-        axes[0].set_ylabel('True Label')
-        axes[0].set_xlabel('Predicted Label')
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[0], xticklabels=["Normal", "Fraud"], yticklabels=["Normal", "Fraud"])
+        axes[0].set_title("Confusion Matrix")
+        axes[0].set_ylabel("True Label")
+        axes[0].set_xlabel("Predicted Label")
 
-        # Plot 2: ROC Curve
         fpr, tpr, _ = roc_curve(all_labels, all_probs)
         roc_auc = auc(fpr, tpr)
-        axes[1].plot(fpr, tpr, color='darkorange', lw=2, 
-                    label=f'ROC curve (AUC = {roc_auc:.4f})')
-        axes[1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-        axes[1].set_xlim([0.0, 1.0])
-        axes[1].set_ylim([0.0, 1.05])
-        axes[1].set_xlabel('False Positive Rate')
-        axes[1].set_ylabel('True Positive Rate')
-        axes[1].set_title('ROC Curve')
+        axes[1].plot(fpr, tpr, lw=2, label=f"ROC curve (AUC = {roc_auc:.4f})")
+        axes[1].plot([0, 1], [0, 1], lw=2, linestyle="--")
+        axes[1].set_title("ROC Curve")
+        axes[1].set_xlabel("False Positive Rate")
+        axes[1].set_ylabel("True Positive Rate")
         axes[1].legend(loc="lower right")
-
         plt.tight_layout()
-        plt.savefig(f'{save_dir}/evaluation_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"\n✓ Metrics saved to {save_dir}/")
+        plt.savefig(Path(save_dir) / "evaluation_metrics.png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"✓ Metrics saved to {save_dir}")
 
 
-def plot_training_history(history: Dict, save_dir: str='./results'):
-    """Plot training history"""
+def plot_training_history(history: Dict[str, list], save_dir: str = "./results"):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-    
-    metrics = ['loss', 'accuracy', 'precision', 'recall', 'f1', 'auc']
-    
+    fig, axes = plt.subplots(3, 3, figsize=(18, 11))
+    metrics = ["loss", "accuracy", "precision", "recall", "f1", "f2", "auc", "pr_auc"]
     for idx, metric in enumerate(metrics):
-        row, col = idx // 3, idx % 3
-        
-        train_key = f'train_{metric}'
-        val_key = f'val_{metric}'
-        
-        if train_key in history and val_key in history:
-            axes[row, col].plot(history[train_key], label=f'Train {metric}', marker='o')
-            axes[row, col].plot(history[val_key], label=f'Val {metric}', marker='s')
-            axes[row, col].set_title(f'{metric.upper()}')
-            axes[row, col].set_xlabel('Epoch')
-            axes[row, col].set_ylabel(metric.upper())
-            axes[row, col].legend()
-            axes[row, col].grid(True, alpha=0.3)
-    
+        row, col = divmod(idx, 3)
+        ax = axes[row, col]
+        ax.plot(history[f"train_{metric}"], label=f"Train {metric}", marker="o")
+        ax.plot(history[f"val_{metric}"], label=f"Val {metric}", marker="s")
+        ax.set_title(metric.upper())
+        ax.set_xlabel("Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    axes[2, 2].plot(history["val_threshold"], label="Val threshold", marker="d")
+    axes[2, 2].set_title("THRESHOLD")
+    axes[2, 2].set_xlabel("Epoch")
+    axes[2, 2].legend()
+    axes[2, 2].grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/training_history.png', dpi=300, bbox_inches='tight')
-    print(f"✓ Training history saved to {save_dir}/training_history.png")
+    plt.savefig(Path(save_dir) / "training_history.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"✓ Training history saved to {Path(save_dir) / 'training_history.png'}")
+
+
+def build_sampler(labels: np.ndarray, minority_weight: float = 1.30) -> WeightedRandomSampler:
+    counts = np.bincount(labels.astype(int), minlength=2).astype(np.float64)
+    counts[counts == 0] = 1.0
+    # softer than pure inverse frequency to reduce overcorrection
+    class_weights = np.array([1.0, minority_weight], dtype=np.float64)
+    # moderate minority upweighting to avoid flooding false positives
+    if counts[1] == 0:
+        class_weights[1] = 1.0
+    sample_weights = class_weights[labels.astype(int)]
+    return WeightedRandomSampler(torch.DoubleTensor(sample_weights), num_samples=len(sample_weights), replacement=True)
 
 
 if __name__ == "__main__":
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    # Argument parser
-    parser = argparse.ArgumentParser(
-        description='Fraud Detection with Hybrid CNN-DeepFM'
-    )
-    parser.add_argument('--train_csv', type=str, default='data/merge/train_processed.csv',
-                       help='Path to training CSV')
-    parser.add_argument('--test_csv', type=str, default='data/merge/test_processed.csv',
-                       help='Path to test CSV')
-    parser.add_argument('--output', type=str, default='submission.csv',
-                       help='Output submission file')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Learning rate')
-    parser.add_argument('--val_split', type=float, default=0.2,
-                       help='Validation split ratio')
-    parser.add_argument('--use_pos_weight', action='store_true',
-                       help='Use pos_weight for imbalanced data')
-    parser.add_argument('--mode', type=str, default='train',
-                       choices=['train', 'predict', 'train_and_predict'],
-                       help='Mode: train, predict, or train_and_predict')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                       help='Checkpoint path for prediction')
-    parser.add_argument('--model_save_path', type=str, default='best_fraud_model.pth',
-                       help='Path to save best model')
-    parser.add_argument('--results_dir', type=str, default='./results',
-                       help='Directory to save results')
-    parser.add_argument('--use_focal_loss', action='store_true', default=True,
-                       help='Use Focal Loss for imbalanced fraud detection')
-    parser.add_argument('--focal_alpha', type=float, default=0.90,
-                       help='Alpha parameter for Focal Loss')
-    parser.add_argument('--focal_gamma', type=float, default=3.0,
-                       help='Gamma parameter for Focal Loss')
-    parser.add_argument('--threshold_metric', type=str, default='recall', choices=['f1', 'recall'],
-                       help='Metric used to tune classification threshold on validation set')
-    
+    set_seed(42)
+    parser = argparse.ArgumentParser(description="High-precision Fraud Detection with CNN-DeepFM")
+    parser.add_argument("--train_csv", type=str, default="data/merge/train_processed.csv")
+    parser.add_argument("--val_csv", type=str, default="data/merge/val_processed.csv")
+    parser.add_argument("--test_csv", type=str, default="data/merge/test_processed.csv")
+    parser.add_argument("--output", type=str, default="submission.csv")
+    parser.add_argument("--mode", type=str, default="train_and_predict", choices=["train", "predict", "train_and_predict"])
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--model_save_path", type=str, default="best_fraud_model_final.pth")
+    parser.add_argument("--results_dir", type=str, default="./results")
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--use_focal_loss", action="store_true", default=False)
+    parser.add_argument("--focal_alpha", type=float, default=0.75)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--threshold_metric", type=str, default="f1", choices=["f1", "f2", "recall"])
+    parser.add_argument("--threshold_min_precision", type=float, default=0.20)
+    parser.add_argument("--minority_weight", type=float, default=1.30,
+                       help="Minority-class weight for WeightedRandomSampler.")
+    parser.add_argument("--fixed_threshold", type=float, default=-1.0,
+                       help="Fixed decision threshold. Set to a negative value to enable automatic threshold tuning.")
     args = parser.parse_args()
-    
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     args.train_csv = resolve_csv_path(args.train_csv)
+    args.val_csv = resolve_csv_path(args.val_csv)
     args.test_csv = resolve_csv_path(args.test_csv)
 
-    print("\n" + "="*70)
-    print("🔍 IEEE-CIS FRAUD DETECTION: Hybrid CNN-DeepFM")
-    print("="*70)
-    print(f"Device: {DEVICE}")
+    print("\n" + "=" * 70)
+    print("HIGH-PRECISION IEEE-CIS FRAUD DETECTION: CNN-DeepFM")
+    print("=" * 70)
+    print(f"Device: {device}")
     print(f"Mode: {args.mode}")
     print(f"Train CSV: {args.train_csv}")
+    print(f"Val CSV: {args.val_csv}")
     print(f"Test CSV: {args.test_csv}")
-    print("="*70 + "\n")
-    
-    if args.mode in ['train', 'train_and_predict']:
-        # ========== LOAD TRAINING DATA ==========
-        print("📂 Loading training data...")
-        full_dataset = IEEEFraudDataset(args.train_csv, target_col='isFraud', normalize=True)
-        
-        n_features = full_dataset.X.shape[1]
-        print(f"📊 Number of features: {n_features}\n")
-        
-        # Split into train/val
-        train_size = int((1 - args.val_split) * len(full_dataset))
-        val_size = len(full_dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        print(f"📈 Train samples: {len(train_dataset)}")
-        print(f"📉 Val samples: {len(val_dataset)}\n")
-        
-        # Create fraud-aware train sampler
-        train_indices = train_dataset.indices
-        train_labels = full_dataset.y[train_indices].numpy().astype(int)
-        class_counts = np.bincount(train_labels, minlength=2).astype(np.float64)
-        class_counts[class_counts == 0] = 1.0
-        class_weights = 1.0 / class_counts
-        sample_weights = class_weights[train_labels]
-        train_sampler = WeightedRandomSampler(
-            weights=torch.DoubleTensor(sample_weights),
-            num_samples=len(sample_weights),
-            replacement=True
-        )
+    print("=" * 70 + "\n")
 
-        # Create dataloaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            sampler=train_sampler,
-            num_workers=4,
-            pin_memory=True if DEVICE == 'cuda' else False
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True if DEVICE == 'cuda' else False
-        )
-        
-        # Calculate pos_weight for imbalanced data
-        pos_weight = None
-        if args.use_pos_weight and full_dataset.has_target:
-            n_pos = full_dataset.y.sum().item()
-            n_neg = len(full_dataset.y) - n_pos
-            pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
-            print(f"⚖️  Pos Weight: {pos_weight:.2f} (to balance {n_neg} vs {n_pos})\n")
-        
-        # ========== BUILD MODEL ==========
-        print("🏗️  Building Hybrid CNN-DeepFM model...")
-        model = HybridCNNDeepFM(
-            tabular_dim=n_features,
-            embed_dim=64,
-            conv_channels=128,
-            kernel_size=3,
-            bilinear_rank=64,
-            bilinear_out_dim=256,
-            seq_length=10,
-            cnn_dropout=0.3,
-            num_classes=2,
-            deepfm_embed_dim=16,
-            deepfm_hidden=[256, 128, 64],
-            deepfm_dropout=0.2,
-            freeze_cnn=False,
-        )
-        
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"✓ Total trainable parameters: {total_params:,}\n")
-        
-        # ========== TRAINING ==========
-        print("🚀 Starting training...\n")
-        trainer = FraudDetectionTrainer(
-            model=model,
-            device=DEVICE,
-            learning_rate=args.lr,
-            weight_decay=1e-5,
-            pos_weight=pos_weight,
-            use_focal_loss=args.use_focal_loss,
-            focal_alpha=args.focal_alpha,
-            focal_gamma=args.focal_gamma,
-            threshold_metric=args.threshold_metric,
-        )
-        
-        history = trainer.fit(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            epochs=args.epochs,
-            early_stopping_patience=15,
-            save_path=args.model_save_path,
-        )
-        
-        # Plot training history
-        plot_training_history(history, save_dir=args.results_dir)
-        
-        # Save detailed metrics
-        trainer.save_best_metrics(val_loader, save_dir=args.results_dir)
-        
-        print("\n" + "="*70)
-        print("✅ TRAINING COMPLETED!")
-        print("="*70 + "\n")
-        
-        # ========== PREDICTION ==========
-        if args.mode == 'train_and_predict':
-            print("🔮 Starting prediction on test set...\n")
-            
-            # Load best model
-            trainer.load_checkpoint(args.model_save_path)
-            
-            # Load test data
-            print("📂 Loading test data...")
-            test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud', normalize=True)
-            
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True if DEVICE == 'cuda' else False
-            )
-            
-            # Make predictions
-            print("🎯 Making predictions...")
-            predictions, probabilities = trainer.predict(test_loader)
-            
-            # Create submission file
-            print(f"\n💾 Creating submission file: {args.output}")
-            test_df = pd.read_csv(args.test_csv)
-            
-            if 'TransactionID' in test_df.columns:
-                submission_df = pd.DataFrame({
-                    'TransactionID': test_df['TransactionID'],
-                    'isFraud': probabilities
-                })
-            else:
-                submission_df = pd.DataFrame({
-                    'TransactionID': range(len(probabilities)),
-                    'isFraud': probabilities
-                })
-            
-            submission_df.to_csv(args.output, index=False)
-            
-            # Print statistics
-            print(f"\n{'='*60}")
-            print("📊 PREDICTION STATISTICS")
-            print(f"{'='*60}")
-            print(f"✓ Total predictions: {len(submission_df)}")
-            print(f"✓ Mean fraud probability: {probabilities.mean():.4f}")
-            print(f"✓ Predictions > 0.5: {(probabilities > 0.5).sum()} ({100*(probabilities > 0.5).sum()/len(probabilities):.2f}%)")
-            print(f"✓ Predictions > 0.3: {(probabilities > 0.3).sum()} ({100*(probabilities > 0.3).sum()/len(probabilities):.2f}%)")
-            print(f"✓ Predictions > 0.7: {(probabilities > 0.7).sum()} ({100*(probabilities > 0.7).sum()/len(probabilities):.2f}%)")
-            print(f"✓ Saved to: {args.output}")
-            print(f"{'='*60}\n")
-    
-    elif args.mode == 'predict':
-        if args.checkpoint is None:
-            raise ValueError("❌ --checkpoint is required for prediction mode")
-        
-        # Load test data
-        print("📂 Loading test data...")
-        test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud', normalize=True)
-        
+    train_dataset = val_dataset = test_dataset = None
+    train_loader = val_loader = test_loader = None
+    n_features = None
+    pos_weight = None
+
+    if args.mode in ["train", "train_and_predict"]:
+        train_dataset = IEEEFraudDataset(args.train_csv)
+        val_dataset = IEEEFraudDataset(args.val_csv)
+        n_features = train_dataset.X.shape[1]
+        if val_dataset.X.shape[1] != n_features:
+            raise ValueError(f"Feature mismatch: train={n_features}, val={val_dataset.X.shape[1]}")
+        if train_dataset.feature_names != val_dataset.feature_names:
+            raise ValueError("Feature name/order mismatch between train and val.")
+
+        train_labels = train_dataset.y.numpy().astype(int)
+        sampler = build_sampler(train_labels, minority_weight=args.minority_weight)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=(device == "cuda"))
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device == "cuda"))
+
+        n_pos = float(train_dataset.y.sum().item())
+        n_neg = float(len(train_dataset.y) - n_pos)
+        pos_weight = min(2.0, (n_neg / n_pos) ** 0.40) if n_pos > 0 else 1.0
+        print(f"✓ High-precision pos_weight: {pos_weight:.4f}")
+    else:
+        test_dataset = IEEEFraudDataset(args.test_csv)
         n_features = test_dataset.X.shape[1]
-        
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True if DEVICE == 'cuda' else False
-        )
-        
-        # Create model
-        print("🏗️  Building model...")
-        model = HybridCNNDeepFM(
-            tabular_dim=n_features,
-            embed_dim=64,
-            conv_channels=128,
-            kernel_size=3,
-            bilinear_rank=64,
-            bilinear_out_dim=256,
-            seq_length=10,
-            cnn_dropout=0.3,
-            num_classes=2,
-            deepfm_embed_dim=16,
-            deepfm_hidden=[256, 128, 64],
-            deepfm_dropout=0.2,
-            freeze_cnn=False,
-        )
-        
-        # Create trainer and load checkpoint
-        trainer = FraudDetectionTrainer(model=model, device=DEVICE)
-        trainer.load_checkpoint(args.checkpoint)
-        
-        # Make predictions
-        print("\n🎯 Making predictions...")
-        predictions, probabilities = trainer.predict(test_loader)
-        
-        # Create submission file
-        print(f"\n💾 Creating submission file: {args.output}")
-        test_df = pd.read_csv(args.test_csv)
-        
-        if 'TransactionID' in test_df.columns:
-            submission_df = pd.DataFrame({
-                'TransactionID': test_df['TransactionID'],
-                'isFraud': probabilities
-            })
+
+    model = HybridCNNDeepFM(tabular_dim=n_features)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"✓ Total trainable parameters: {total_params:,}")
+
+    trainer = FraudDetectionTrainer(
+        model=model,
+        device=device,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        pos_weight=pos_weight if args.mode in ["train", "train_and_predict"] else None,
+        use_focal_loss=args.use_focal_loss,
+        focal_alpha=args.focal_alpha,
+        focal_gamma=args.focal_gamma,
+        threshold_metric=args.threshold_metric,
+        threshold_min_precision=args.threshold_min_precision,
+        threshold_warmup_epochs=8,
+        fixed_threshold=(None if args.fixed_threshold < 0 else args.fixed_threshold),
+    )
+
+    if args.mode in ["train", "train_and_predict"]:
+        history = trainer.fit(train_loader, val_loader, epochs=args.epochs, early_stopping_patience=6, save_path=args.model_save_path)
+        plot_training_history(history, save_dir=args.results_dir)
+        trainer.load_checkpoint(args.model_save_path)
+        trainer.save_best_metrics(val_loader, save_dir=args.results_dir)
+        print("\n✅ TRAINING COMPLETED")
+
+    if args.mode in ["predict", "train_and_predict"]:
+        if args.mode == "predict":
+            if args.checkpoint is None:
+                raise ValueError("--checkpoint is required for predict mode")
+            trainer.load_checkpoint(args.checkpoint)
+            test_dataset = IEEEFraudDataset(args.test_csv)
         else:
-            submission_df = pd.DataFrame({
-                'TransactionID': range(len(probabilities)),
-                'isFraud': probabilities
-            })
-        
+            test_dataset = IEEEFraudDataset(args.test_csv)
+
+        if test_dataset.X.shape[1] != n_features:
+            raise ValueError(f"Feature mismatch: train/model={n_features}, test={test_dataset.X.shape[1]}")
+        if args.mode in ["train", "train_and_predict"] and train_dataset is not None:
+            if train_dataset.feature_names != test_dataset.feature_names:
+                raise ValueError("Feature name/order mismatch between train and test.")
+
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device == "cuda"))
+        predictions, probabilities = trainer.predict(test_loader)
+        test_df = pd.read_csv(args.test_csv)
+        if "TransactionID" in test_df.columns:
+            submission_df = pd.DataFrame({"TransactionID": test_df["TransactionID"], "isFraud": probabilities})
+        else:
+            submission_df = pd.DataFrame({"TransactionID": range(len(probabilities)), "isFraud": probabilities})
         submission_df.to_csv(args.output, index=False)
-        
-        # Print statistics
-        print(f"\n{'='*60}")
-        print("📊 PREDICTION STATISTICS")
-        print(f"{'='*60}")
-        print(f"✓ Total predictions: {len(submission_df)}")
+        print(f"✓ Submission saved to {args.output}")
         print(f"✓ Mean fraud probability: {probabilities.mean():.4f}")
-        print(f"✓ Predictions > 0.5: {(probabilities > 0.5).sum()} ({100*(probabilities > 0.5).sum()/len(probabilities):.2f}%)")
-        print(f"✓ Predictions > 0.3: {(probabilities > 0.3).sum()} ({100*(probabilities > 0.3).sum()/len(probabilities):.2f}%)")
-        print(f"✓ Predictions > 0.7: {(probabilities > 0.7).sum()} ({100*(probabilities > 0.7).sum()/len(probabilities):.2f}%)")
-        print(f"✓ Saved to: {args.output}")
-        print(f"{'='*60}\n")
+        print(f"✓ Predictions >= threshold ({trainer.best_threshold:.4f}): {(probabilities >= trainer.best_threshold).sum()}")
