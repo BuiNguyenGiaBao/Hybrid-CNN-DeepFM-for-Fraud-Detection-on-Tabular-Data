@@ -129,6 +129,7 @@ class HybridCNNDeepFM(nn.Module):
         deepfm_embed_dim: int = 10,
         deepfm_hidden=None,
         deepfm_dropout: float = 0.45,
+        dense_num_fields: int = 4,
         freeze_cnn: bool = False,
     ):
         super().__init__()
@@ -155,6 +156,7 @@ class HybridCNNDeepFM(nn.Module):
             deep_hidden=deepfm_hidden,
             dropout=deepfm_dropout,
             dense_in_dim=bilinear_out_dim,
+            dense_num_fields=dense_num_fields,
             use_bias=True,
         )
 
@@ -554,6 +556,8 @@ if __name__ == "__main__":
                        help="Minority-class weight for WeightedRandomSampler.")
     parser.add_argument("--fixed_threshold", type=float, default=-1.0,
                        help="Fixed decision threshold. Set to a negative value to enable automatic threshold tuning.")
+    parser.add_argument("--dense_num_fields", type=int, default=4,
+                       help="Number of latent dense fields created from CNN embedding for the FM branch.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -598,7 +602,7 @@ if __name__ == "__main__":
         test_dataset = IEEEFraudDataset(args.test_csv)
         n_features = test_dataset.X.shape[1]
 
-    model = HybridCNNDeepFM(tabular_dim=n_features)
+    model = HybridCNNDeepFM(tabular_dim=n_features, dense_num_fields=args.dense_num_fields)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"✓ Total trainable parameters: {total_params:,}")
 
